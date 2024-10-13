@@ -64,6 +64,8 @@ class CoolerMapDataParserConfig(ColmapDataParserConfig):
     """Whether to load pcd normals for normal initialisation"""
     load_3D_points: bool = True
     """Whether to load the 3D points from the colmap reconstruction."""
+    load_3D_points_from: Literal["depthmap", "colmap"] = "colmap"
+    """Whether to load 3D points from depthmap or colmap."""
     eval_mode: Literal["fraction", "filename", "interval", "all"] = "interval"
     """
     Interval uses every nth frame for eval (used by most academic papers, e.g. MipNerf360, GSplat).
@@ -224,7 +226,6 @@ class CoolerMapDataParser(ColmapDataParser):
                     raise NotImplementedError
             normal_filenames = self.get_normal_filepaths()
 
-
         image_filenames, mask_filenames, depth_filenames, normal_filenames, downscale_factor = self._setup_downscale_factor(
             image_filenames, mask_filenames, depth_filenames, normal_filenames
         )
@@ -246,7 +247,7 @@ class CoolerMapDataParser(ColmapDataParser):
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
 
-                # in x,y,z order
+        # in x,y,z order
         # assumes that the scene is centered at the origin
         aabb_scale = self.config.scene_scale
         scene_box = SceneBox(
@@ -300,9 +301,16 @@ class CoolerMapDataParser(ColmapDataParser):
 
         if self.config.load_3D_points:
             # Load 3D points
-            metadata.update(
-                self._load_3D_points(colmap_path, transform_matrix, scale_factor)
-            )
+            if self.config.load_3D_points_from == "depthmap":
+                metadata.update(
+                    self._load_3D_points_from_depthmap(cameras, image_filenames, mask_filenames, depth_filenames) 
+                )
+            elif self.config.load_3D_points_from == "colmap":
+                metadata.update(
+                    self._load_3D_points(colmap_path, transform_matrix, scale_factor)
+                )
+            else:
+                raise NotImplementedError
 
         metadata.update({"depth_mode": self.config.depth_mode})
         metadata.update({"load_depths": self.config.load_depths})
@@ -481,6 +489,47 @@ class CoolerMapDataParser(ColmapDataParser):
             @ transform_matrix.T
         )
         return {"points3D_normals": points3D_normals}
+
+    def _load_3D_points_from_depthmap(self, cameras: Cameras, image_filenames, mask_filenames, depth_filenames):
+        out = {
+            "points3D_xyz": [],
+            "points3D_rgb": [],
+        }
+        points3D_xyz = []
+        points3D_rgb = []
+        for i in range(len(cameras)):
+            depth_filename = depth_filenames[i]
+            depths = torch.from_numpy(np.load(depth_filename))
+            depths = depths.view(-1, 1)
+            rgb_filename = image_filenames[i]
+            rgb = torch.from_numpy(np.array(Image.open(rgb_filename)).astype(np.float32))
+            rgb = rgb.view(-1, 3)
+            rays = cameras.generate_rays(
+                camera_indices=i,
+            )
+            rays_o = rays.origins.view(-1, 3)
+            rays_d = rays.directions.view(-1, 3)
+            if len(mask_filenames) > 0:
+                mask_filename = mask_filenames[i]
+                mask = torch.from_numpy(np.array(Image.open(mask_filename))).astype(bool)
+                mask = mask.view(-1, 1)
+                depths = depths[mask]
+                rays_o = rays_o[mask]
+                rays_d = rays_d[mask]
+                rgb = rgb[mask]
+            points3D_xyz.append(rays_o + rays_d * depths)
+            points3D_rgb.append(rgb)
+        points3D_xyz = torch.cat(points3D_xyz, dim=0)
+        points3D_rgb = torch.cat(points3D_rgb, dim=0)
+        pcb = o3d.geometry.PointCloud()
+        pcb.points = o3d.utility.Vector3dVector(points3D_xyz.cpu().numpy())
+        pcb.colors = o3d.utility.Vector3dVector(points3D_rgb.cpu().numpy())
+        # downsample to 100000 points
+        if len(points3D_xyz) > 100000:
+            pcb = pcb.voxel_down_sample(voxel_size=0.01)
+        out["points3D_xyz"] = torch.from_numpy(np.asarray(pcb.points, dtype=np.float32))
+        out["points3D_rgb"] = torch.from_numpy(np.asarray(pcb.colors, dtype=np.float32))
+        return out
 
 
 CoolerMapDataParserSpecification = DataParserSpecification(
